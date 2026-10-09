@@ -7,10 +7,17 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class Main {
 
-    public static void main(String[] args) throws SQLException {
+    public static void main(String[] args) throws SQLException, InterruptedException, ExecutionException, TimeoutException {
 
         try (Connection connection = openConnection()) {
 
@@ -39,6 +46,7 @@ public class Main {
             System.out.println("Verification passed: total balance is unchanged.");
 
             demonstrateRollback(connection);
+            demonstrateConcurrentTransfers(connection);
 
         }
 
@@ -76,6 +84,12 @@ public class Main {
 
     private static void transfer(long sourceId, long destinationId, long amountMinorUnits, boolean failAfterDebit) throws SQLException {
 
+        transfer(sourceId, destinationId, amountMinorUnits, failAfterDebit, null, null);
+
+    }
+
+    private static void transfer(long sourceId, long destinationId, long amountMinorUnits, boolean failAfterDebit, CountDownLatch ready, CountDownLatch start) throws SQLException {
+
         if (sourceId == destinationId) {
             throw new IllegalArgumentException("Source and destination must be different.");
         }
@@ -85,6 +99,25 @@ public class Main {
         }
 
         try (Connection connection = openConnection()) {
+
+            if (ready != null && start != null) {
+
+                ready.countDown();
+
+                try {
+
+                    if (!start.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Timed out waiting for the concurrent start signal.");
+                    }
+
+                } catch (InterruptedException exception) {
+
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Transfer interrupted before starting.", exception);
+
+                }
+
+            }
 
             connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
             connection.setAutoCommit(false);
@@ -128,6 +161,74 @@ public class Main {
         }
 
         System.out.println("\nTransferred " + money(amountMinorUnits) + " from account " + sourceId + " to account " + destinationId);
+
+    }
+
+    private static void demonstrateConcurrentTransfers(Connection connection) throws SQLException, InterruptedException, ExecutionException, TimeoutException {
+
+        System.out.println("\nBEFORE CONCURRENT TRANSFERS");
+        printAccounts(connection);
+
+        long sourceBefore = accountBalance(connection, 1);
+        long destinationBefore = accountBalance(connection, 2);
+        long totalBefore = totalBalance(connection);
+
+        if (sourceBefore < 10_000 || destinationBefore < 5_000) {
+            throw new IllegalStateException("Both accounts need sufficient funds before the concurrent demonstration.");
+        }
+
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        try {
+
+            Future<Void> firstTransfer = executor.submit(() -> {
+
+                transfer(1, 2, 10_000, false, ready, start);
+                return null;
+
+            });
+
+            Future<Void> secondTransfer = executor.submit(() -> {
+
+                transfer(2, 1, 5_000, false, ready, start);
+                return null;
+
+            });
+
+            if (!ready.await(10, TimeUnit.SECONDS)) {
+                throw new TimeoutException("Both transfer connections were not ready in time.");
+            }
+
+            System.out.println("Both worker connections are ready. Starting transfers.");
+            start.countDown();
+
+            firstTransfer.get(20, TimeUnit.SECONDS);
+            secondTransfer.get(20, TimeUnit.SECONDS);
+
+        } finally {
+
+            executor.shutdownNow();
+
+            if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Transfer workers did not stop in time.");
+            }
+
+        }
+
+        System.out.println("\nAFTER CONCURRENT TRANSFERS");
+        printAccounts(connection);
+
+        long sourceAfter = accountBalance(connection, 1);
+        long destinationAfter = accountBalance(connection, 2);
+        long totalAfter = totalBalance(connection);
+
+        if (sourceAfter != sourceBefore - 5_000 || destinationAfter != destinationBefore + 5_000 || totalBefore != totalAfter) {
+            throw new IllegalStateException("Verification failed: concurrent transfers produced unexpected balances.");
+        }
+
+        System.out.println("Verification passed: both concurrent transfers committed with the expected balances and unchanged total.");
 
     }
 
