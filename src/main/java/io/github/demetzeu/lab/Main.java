@@ -38,6 +38,8 @@ public class Main {
 
             System.out.println("Verification passed: total balance is unchanged.");
 
+            demonstrateRollback(connection);
+
         }
 
     }
@@ -68,6 +70,12 @@ public class Main {
 
     private static void transfer(long sourceId, long destinationId, long amountMinorUnits) throws SQLException {
 
+        transfer(sourceId, destinationId, amountMinorUnits, false);
+
+    }
+
+    private static void transfer(long sourceId, long destinationId, long amountMinorUnits, boolean failAfterDebit) throws SQLException {
+
         if (sourceId == destinationId) {
             throw new IllegalArgumentException("Source and destination must be different.");
         }
@@ -96,6 +104,11 @@ public class Main {
                 }
 
                 changeBalance(connection, sourceId, -amountMinorUnits);
+
+                if (failAfterDebit) {
+                    throw new SimulatedTransferException();
+                }
+
                 changeBalance(connection, destinationId, amountMinorUnits);
 
                 connection.commit();
@@ -115,6 +128,81 @@ public class Main {
         }
 
         System.out.println("\nTransferred " + money(amountMinorUnits) + " from account " + sourceId + " to account " + destinationId);
+
+    }
+
+    private static void demonstrateRollback(Connection connection) throws SQLException {
+
+        System.out.println("\nBEFORE FAILED TRANSFER");
+        printAccounts(connection);
+
+        long sourceBefore = accountBalance(connection, 1);
+        long destinationBefore = accountBalance(connection, 2);
+        long totalBefore = totalBalance(connection);
+        boolean failureObserved = false;
+
+        try {
+
+            transfer(1, 2, 10_000, true);
+
+        } catch (SimulatedTransferException exception) {
+
+            if (exception.getSuppressed().length > 0) {
+                throw exception;
+            }
+
+            failureObserved = true;
+            System.out.println("Expected failure: " + exception.getMessage());
+
+        }
+
+        if (!failureObserved) {
+            throw new IllegalStateException("Verification failed: simulated failure did not occur.");
+        }
+
+        System.out.println("\nAFTER ROLLBACK");
+        printAccounts(connection);
+
+        long sourceAfter = accountBalance(connection, 1);
+        long destinationAfter = accountBalance(connection, 2);
+        long totalAfter = totalBalance(connection);
+
+        if (sourceBefore != sourceAfter || destinationBefore != destinationAfter || totalBefore != totalAfter) {
+            throw new IllegalStateException("Verification failed: rollback changed account balances.");
+        }
+
+        System.out.println("Verification passed: rollback preserved both account balances and the total.");
+
+    }
+
+    private static long accountBalance(Connection connection, long accountId) throws SQLException {
+
+        String sql = "SELECT balance_minor_units FROM accounts WHERE id = ?";
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+
+            statement.setLong(1, accountId);
+            statement.setQueryTimeout(10);
+
+            try (ResultSet result = statement.executeQuery()) {
+
+                if (!result.next()) {
+                    throw new IllegalArgumentException("Account does not exist: " + accountId);
+                }
+
+                return result.getLong("balance_minor_units");
+
+            }
+
+        }
+
+    }
+
+    private static class SimulatedTransferException extends RuntimeException {
+
+        private SimulatedTransferException() {
+            super("Simulated failure after debit and before credit.");
+        }
 
     }
 
