@@ -8,6 +8,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -47,6 +49,7 @@ public class Main {
 
             demonstrateRollback(connection);
             demonstrateConcurrentTransfers(connection);
+            demonstrateDeadlock(connection);
 
         }
 
@@ -229,6 +232,141 @@ public class Main {
         }
 
         System.out.println("Verification passed: both concurrent transfers committed with the expected balances and unchanged total.");
+
+    }
+
+    private static void demonstrateDeadlock(Connection connection) throws SQLException, InterruptedException, ExecutionException, TimeoutException {
+
+        System.out.println("\nBEFORE DEADLOCK DEMONSTRATION");
+        printAccounts(connection);
+
+        long firstBefore = accountBalance(connection, 1);
+        long secondBefore = accountBalance(connection, 2);
+        long totalBefore = totalBalance(connection);
+        long amountMinorUnits = 10_000;
+
+        if (firstBefore < amountMinorUnits || secondBefore < amountMinorUnits) {
+            throw new IllegalStateException("Both accounts need at least 100 RON for the deadlock demonstration.");
+        }
+
+        String sql = "SELECT EXTRACT(EPOCH FROM current_setting('deadlock_timeout')::interval) AS timeout_seconds";
+
+        try (Statement statement = connection.createStatement(); ResultSet result = statement.executeQuery(sql)) {
+
+            if (!result.next() || result.getDouble("timeout_seconds") >= 8) {
+                throw new IllegalStateException("Deadlock detection must run before the demonstration's 8-second lock timeout.");
+            }
+
+        }
+
+        CyclicBarrier firstLocksHeld = new CyclicBarrier(2);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        boolean firstCommitted;
+        boolean secondCommitted;
+
+        try {
+
+            Future<Boolean> firstTransfer = executor.submit(() -> deadlockTransfer(1, 2, amountMinorUnits, firstLocksHeld));
+            Future<Boolean> secondTransfer = executor.submit(() -> deadlockTransfer(2, 1, amountMinorUnits, firstLocksHeld));
+
+            firstCommitted = firstTransfer.get(25, TimeUnit.SECONDS);
+            secondCommitted = secondTransfer.get(25, TimeUnit.SECONDS);
+
+        } finally {
+
+            executor.shutdownNow();
+
+            if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Deadlock workers did not stop in time.");
+            }
+
+        }
+
+        if (firstCommitted == secondCommitted) {
+            throw new IllegalStateException("Verification failed: expected one committed transfer and one deadlock victim.");
+        }
+
+        System.out.println("\nAFTER DEADLOCK DEMONSTRATION");
+        printAccounts(connection);
+
+        long expectedChange = firstCommitted ? -amountMinorUnits : amountMinorUnits;
+
+        if (accountBalance(connection, 1) != firstBefore + expectedChange || accountBalance(connection, 2) != secondBefore - expectedChange || totalBalance(connection) != totalBefore) {
+            throw new IllegalStateException("Verification failed: balances do not match the surviving transfer.");
+        }
+
+        System.out.println("Verification passed: one transfer committed, one was rolled back with SQLSTATE 40P01, and the total is unchanged.");
+
+    }
+
+    private static boolean deadlockTransfer(long sourceId, long destinationId, long amountMinorUnits, CyclicBarrier firstLocksHeld) throws SQLException, InterruptedException, BrokenBarrierException, TimeoutException {
+
+        try (Connection connection = openConnection()) {
+
+            connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+            connection.setAutoCommit(false);
+
+            try {
+
+                try (Statement statement = connection.createStatement()) {
+
+                    statement.execute("SET LOCAL lock_timeout = '8s'");
+                    statement.execute("SET LOCAL statement_timeout = '10s'");
+
+                }
+
+                long sourceBalance = lockAccount(connection, sourceId);
+                System.out.println("Transfer " + sourceId + " -> " + destinationId + " holds account " + sourceId);
+
+                if (sourceBalance < amountMinorUnits) {
+                    throw new IllegalArgumentException("Insufficient funds in account " + sourceId);
+                }
+
+                firstLocksHeld.await(10, TimeUnit.SECONDS);
+
+                System.out.println("Transfer " + sourceId + " -> " + destinationId + " requests account " + destinationId);
+                lockAccount(connection, destinationId);
+
+                changeBalance(connection, sourceId, -amountMinorUnits);
+                changeBalance(connection, destinationId, amountMinorUnits);
+                connection.commit();
+
+                System.out.println("Transfer " + sourceId + " -> " + destinationId + " committed.");
+                return true;
+
+            } catch (SQLException exception) {
+
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackException) {
+                    exception.addSuppressed(rollbackException);
+                    throw exception;
+                }
+
+                if (!"40P01".equals(exception.getSQLState())) {
+                    throw exception;
+                }
+
+                System.out.println("Deadlock victim: transfer " + sourceId + " -> " + destinationId + "; SQLSTATE " + exception.getSQLState() + "; transaction rolled back.");
+                return false;
+
+            } catch (InterruptedException | BrokenBarrierException | TimeoutException | RuntimeException exception) {
+
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackException) {
+                    exception.addSuppressed(rollbackException);
+                }
+
+                if (exception instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+
+                throw exception;
+
+            }
+
+        }
 
     }
 
