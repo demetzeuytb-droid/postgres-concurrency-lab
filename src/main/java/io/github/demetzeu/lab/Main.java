@@ -25,6 +25,7 @@ public class Main {
 
             createAccountsTable(connection);
             seedAccounts(connection);
+            resetDemoAccounts(connection);
 
             System.out.println("BEFORE TRANSFER");
             printAccounts(connection);
@@ -50,6 +51,7 @@ public class Main {
             demonstrateRollback(connection);
             demonstrateConcurrentTransfers(connection);
             demonstrateDeadlock(connection);
+            demonstrateIsolationLevels(connection);
 
         }
 
@@ -75,6 +77,240 @@ public class Main {
 
         try (Statement statement = connection.createStatement()) {
             statement.executeUpdate(sql);
+        }
+
+    }
+
+    private static void resetDemoAccounts(Connection connection) throws SQLException {
+
+        String sql = "UPDATE accounts SET balance_minor_units = 100000 WHERE id IN (1, 2)";
+
+        try (Statement statement = connection.createStatement()) {
+
+            if (statement.executeUpdate(sql) != 2) {
+                throw new SQLException("Expected to reset both demo accounts.");
+            }
+
+        }
+
+        System.out.println("Demo accounts reset: Andrei and Mihai each start with 1000.00 RON.");
+
+    }
+
+    private static void demonstrateIsolationLevels(Connection connection) throws SQLException, InterruptedException, ExecutionException, TimeoutException {
+
+        int[] isolationLevels = {Connection.TRANSACTION_READ_COMMITTED, Connection.TRANSACTION_REPEATABLE_READ, Connection.TRANSACTION_SERIALIZABLE};
+        String[] isolationNames = {"READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"};
+
+        try {
+
+            for (int index = 0; index < isolationLevels.length; index++) {
+
+                resetDemoAccounts(connection);
+                demonstrateRepeatedRead(connection, isolationLevels[index], isolationNames[index]);
+                demonstrateWriteSkew(connection, isolationLevels[index], isolationNames[index]);
+
+            }
+
+        } finally {
+
+            resetDemoAccounts(connection);
+
+        }
+
+    }
+
+    private static void demonstrateRepeatedRead(Connection observer, int isolationLevel, String isolationName) throws SQLException {
+
+        System.out.println("\nREPEATED READ: " + isolationName);
+        long totalBefore = totalBalance(observer);
+
+        try (Connection reader = openConnection()) {
+
+            reader.setTransactionIsolation(isolationLevel);
+            reader.setAutoCommit(false);
+
+            try {
+
+                long firstRead = accountBalance(reader, 1);
+
+                // A separate connection commits while the reader transaction stays open.
+                transfer(1, 2, 10_000);
+
+                long secondRead = accountBalance(reader, 1);
+                long committedBalance = accountBalance(observer, 1);
+                long expectedSecondRead = isolationLevel == Connection.TRANSACTION_READ_COMMITTED ? firstRead - 10_000 : firstRead;
+
+                System.out.println("First read: " + money(firstRead));
+                System.out.println("Second read in the same transaction: " + money(secondRead));
+                System.out.println("Current committed balance: " + money(committedBalance));
+
+                if (secondRead != expectedSecondRead || committedBalance != firstRead - 10_000 || totalBalance(observer) != totalBefore) {
+                    throw new IllegalStateException("Verification failed: unexpected repeated-read behavior at " + isolationName);
+                }
+
+                reader.commit();
+                System.out.println("Verification passed: repeated reads match " + isolationName + " semantics.");
+
+            } catch (SQLException | RuntimeException exception) {
+
+                rollbackAfterFailure(reader, exception);
+                throw exception;
+
+            }
+
+        }
+
+    }
+
+    private static void demonstrateWriteSkew(Connection observer, int isolationLevel, String isolationName) throws SQLException, InterruptedException, ExecutionException, TimeoutException {
+
+        System.out.println("\nWRITE SKEW: " + isolationName);
+        System.out.println("Separate reserve scenario: at least one reserve must remain available.");
+
+        try (Statement statement = observer.createStatement()) {
+
+            statement.executeUpdate("CREATE TABLE IF NOT EXISTS demo_reserves (id BIGINT PRIMARY KEY, owner_name VARCHAR(100) NOT NULL, available BOOLEAN NOT NULL)");
+            statement.executeUpdate("INSERT INTO demo_reserves (id, owner_name, available) VALUES (1, 'Andrei', TRUE), (2, 'Mihai', TRUE) ON CONFLICT (id) DO UPDATE SET available = TRUE");
+
+        }
+
+        CyclicBarrier bothChecked = new CyclicBarrier(2);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        boolean firstCommitted;
+        boolean secondCommitted;
+
+        try {
+
+            Future<Boolean> first = executor.submit(() -> releaseReserve(1, 2, isolationLevel, bothChecked));
+            Future<Boolean> second = executor.submit(() -> releaseReserve(2, 1, isolationLevel, bothChecked));
+
+            firstCommitted = first.get(25, TimeUnit.SECONDS);
+            secondCommitted = second.get(25, TimeUnit.SECONDS);
+
+        } finally {
+
+            executor.shutdownNow();
+
+            if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Reserve workers did not stop in time.");
+            }
+
+        }
+
+        long availableCount;
+        String sql = "SELECT COUNT(*) AS available_count FROM demo_reserves WHERE id IN (1, 2) AND available";
+
+        try (Statement statement = observer.createStatement(); ResultSet result = statement.executeQuery(sql)) {
+
+            if (!result.next()) {
+                throw new SQLException("Reserve count query returned no result.");
+            }
+
+            availableCount = result.getLong("available_count");
+
+        }
+
+        int committedCount = (firstCommitted ? 1 : 0) + (secondCommitted ? 1 : 0);
+        int expectedCommitted = isolationLevel == Connection.TRANSACTION_SERIALIZABLE ? 1 : 2;
+
+        if (committedCount != expectedCommitted || availableCount != 2 - expectedCommitted) {
+            throw new IllegalStateException("Verification failed: unexpected write-skew outcome at " + isolationName);
+        }
+
+        System.out.println("Committed reserve releases: " + committedCount);
+        System.out.println("Available reserves: " + availableCount);
+        System.out.println(availableCount == 0 ? "Observed anomaly: the shared reserve rule was violated." : "Shared reserve rule preserved; the conflicting transaction was rejected.");
+        System.out.println("Verification passed: write-skew behavior matches " + isolationName + " semantics.");
+
+    }
+
+    private static boolean releaseReserve(long ownId, long otherId, int isolationLevel, CyclicBarrier bothChecked) throws SQLException, InterruptedException, BrokenBarrierException, TimeoutException {
+
+        try (Connection connection = openConnection()) {
+
+            connection.setTransactionIsolation(isolationLevel);
+            connection.setAutoCommit(false);
+
+            try {
+
+                try (Statement statement = connection.createStatement()) {
+
+                    statement.execute("SET LOCAL lock_timeout = '8s'");
+                    statement.execute("SET LOCAL statement_timeout = '10s'");
+
+                }
+
+                String checkSql = "SELECT available FROM demo_reserves WHERE id = ?";
+
+                try (PreparedStatement statement = connection.prepareStatement(checkSql)) {
+
+                    statement.setLong(1, otherId);
+                    statement.setQueryTimeout(10);
+
+                    try (ResultSet result = statement.executeQuery()) {
+
+                        if (!result.next() || !result.getBoolean("available")) {
+                            throw new IllegalStateException("The other reserve must be available before release.");
+                        }
+
+                    }
+
+                }
+
+                System.out.println("Reserve " + ownId + " checked that reserve " + otherId + " is available.");
+                bothChecked.await(10, TimeUnit.SECONDS);
+
+                String updateSql = "UPDATE demo_reserves SET available = FALSE WHERE id = ?";
+
+                try (PreparedStatement statement = connection.prepareStatement(updateSql)) {
+
+                    statement.setLong(1, ownId);
+                    statement.setQueryTimeout(10);
+
+                    if (statement.executeUpdate() != 1) {
+                        throw new SQLException("Expected to release exactly one reserve.");
+                    }
+
+                }
+
+                connection.commit();
+                System.out.println("Reserve " + ownId + " release committed.");
+                return true;
+
+            } catch (SQLException exception) {
+
+                rollbackAfterFailure(connection, exception);
+
+                if (!"40001".equals(exception.getSQLState()) || exception.getSuppressed().length > 0) {
+                    throw exception;
+                }
+
+                System.out.println("Reserve " + ownId + " release rejected with SQLSTATE 40001; transaction rolled back.");
+                return false;
+
+            } catch (InterruptedException | BrokenBarrierException | TimeoutException | RuntimeException exception) {
+
+                rollbackAfterFailure(connection, exception);
+
+                if (exception instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+
+                throw exception;
+
+            }
+
+        }
+
+    }
+
+    private static void rollbackAfterFailure(Connection connection, Exception exception) {
+
+        try {
+            connection.rollback();
+        } catch (SQLException rollbackException) {
+            exception.addSuppressed(rollbackException);
         }
 
     }
